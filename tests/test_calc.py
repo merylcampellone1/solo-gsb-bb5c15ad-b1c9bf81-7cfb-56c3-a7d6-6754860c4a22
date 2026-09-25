@@ -239,6 +239,85 @@ class DeterminismTests(unittest.TestCase):
         self.assertEqual(assigned, [1])
 
 
+class FixedDigitsTests(unittest.TestCase):
+    """币种精度在发票创建时固定：fixed_digits 让复算不受配置变更影响。"""
+
+    def setUp(self) -> None:
+        import os
+
+        self._old = os.environ.get("CURRENCY_DIGITS")
+        os.environ.pop("CURRENCY_DIGITS", None)
+
+    def tearDown(self) -> None:
+        import os
+
+        if self._old is None:
+            os.environ.pop("CURRENCY_DIGITS", None)
+        else:
+            os.environ["CURRENCY_DIGITS"] = self._old
+
+    def test_recompute_uses_fixed_digits_after_config_change(self):
+        import os
+
+        payload = {
+            "currency": "USD",
+            "lines": [
+                line("10.05", "0.10"),
+                line("20.05", "0.10"),
+            ],
+        }
+        saved = compute_invoice(payload)
+        self.assertEqual(saved["currency_digits"], 2)
+        self.assertEqual(
+            [l["tax"] for l in saved["lines"]], ["1.00", "2.01"]
+        )
+        self.assertTrue(recompute_matches(saved, payload))
+
+        # USD 改为零位：不带 fixed_digits 直接复算 -> 净额不再是最小单位整数倍
+        os.environ["CURRENCY_DIGITS"] = "USD:0"
+        with self.assertRaises(ValueError):
+            compute_invoice(payload)
+        # 固定入库精度后复算：不抛错、逐字段一致（残差分配仍是两位口径）
+        fixed = {"USD": 2}
+        self.assertTrue(recompute_matches(saved, payload, fixed))
+        fresh = compute_invoice(payload, fixed)
+        self.assertEqual(fresh, saved)
+
+    def test_fixed_target_digits_for_fx(self):
+        import os
+
+        payload = {
+            "currency": "USD",
+            "target_currency": "CNY",
+            "exchange_rate": "7.123456",
+            "lines": [line("100.00", "0.13"), line("50.00", "0.06")],
+        }
+        saved = compute_invoice(payload)
+        self.assertEqual(saved["fx"]["target_digits"], 2)
+        self.assertEqual(saved["fx"]["total_tax"], "113.98")
+
+        # USD、CNY 都改成零位：不带 fixed_digits 时按新配置复算，目标币为零位、
+        # 结果与入库时不一致；固定两者入库精度后复算结果完全一致
+        os.environ["CURRENCY_DIGITS"] = "USD:0,CNY:0"
+        drifted = compute_invoice(payload)
+        self.assertEqual(drifted["fx"]["target_digits"], 0)
+        self.assertNotEqual(drifted, saved)
+        self.assertTrue(recompute_matches(saved, payload, {"USD": 2, "CNY": 2}))
+
+    def test_new_invoice_uses_current_config(self):
+        import os
+
+        os.environ["CURRENCY_DIGITS"] = "USD:0"
+        r = compute_invoice(
+            {"currency": "USD", "lines": [line("1", "0.1")]}
+        )
+        self.assertEqual(r["currency_digits"], 0)
+        with self.assertRaises(ValueError):
+            compute_invoice(
+                {"currency": "USD", "lines": [line("0.01", "0.1")]}
+            )
+
+
 class LocalPrecisionTests(unittest.TestCase):
     """局部精度：计算结果不依赖调用线程的全局 Decimal 上下文。
 

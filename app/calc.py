@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any, Iterable
 
-from .currency import UnknownCurrencyError, currency_digits
+from .currency import currency_digits
 
 RULE_ID = "half_up_plus_largest_remainder_v1"
 
@@ -59,6 +59,18 @@ def _quantize(value: Decimal, digits: int) -> Decimal:
     """按币种最小单位做 ROUND_HALF_UP 舍入。"""
 
     return value.quantize(_unit(digits), rounding=ROUND_HALF_UP)
+
+
+def _digits_for(currency: str, fixed_digits: dict[str, int] | None = None) -> int:
+    """币种代码 -> 入库时固定的小数位；未固定时按当前 ``CURRENCY_DIGITS`` 解析。
+
+    读取已保存发票时，原币/目标币位数均从发票持久化的精度传入，使复算不受
+    后续币种配置变更影响；新建发票不传 ``fixed_digits``，仍按当前配置校验。
+    """
+
+    if fixed_digits and currency in fixed_digits:
+        return fixed_digits[currency]
+    return currency_digits(currency)
 
 
 def to_decimal(value: Any, field: str) -> Decimal:
@@ -285,21 +297,29 @@ def money_context(amounts: Iterable[Decimal], count: int = 1) -> Iterator[None]:
         yield
 
 
-def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
+def compute_invoice(
+    payload: dict[str, Any],
+    fixed_digits: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """执行完整计算，返回可直接 JSON 序列化（金额全部为字符串）的结果字典。
 
     该函数是纯函数：同样输入必然得到同样输出，持久化与复算都以它为准。
     不读不写全局 Decimal 上下文，任何线程（含默认 28 位精度的 FastAPI
     工作线程）下结果一致。
+
+    ``fixed_digits`` 给出**按币种代码固定的小数位**（键统一为大写币种代码）：
+    提供时原币与目标币的最小单位均以该映射为准，**不再读取当前
+    ``CURRENCY_DIGITS`` 配置**——读取已保存发票时传入该发票入库时的精度，
+    保证币种精度配置变更后旧发票仍能按旧规则复算，不会因净额不再是新最小
+    单位的整数倍而报错，也不会改变残差分配与合计。映射中缺失的币种仍按
+    当前配置解析；新建发票（``fixed_digits=None``）完全沿用当前配置校验。
     """
 
+    fixed_digits = fixed_digits or {}
     currency = str(payload["currency"]).strip().upper()
     if not currency:
         raise ValueError("currency 不能为空")
-    try:
-        digits = currency_digits(currency)
-    except UnknownCurrencyError:
-        raise
+    digits = _digits_for(currency, fixed_digits)
 
     lines_in = _validate_lines(payload.get("lines", []))
     n = len(lines_in)
@@ -346,7 +366,7 @@ def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
             exchange_rate = to_decimal(payload["exchange_rate"], "exchange_rate")
             if exchange_rate <= _ZERO:
                 raise ValueError("exchange_rate 必须为正数")
-            target_digits = currency_digits(target_currency)
+            target_digits = _digits_for(target_currency, fixed_digits)
 
             converted_nets = [
                 _quantize(nets[i] * exchange_rate, target_digits) for i in range(n)
@@ -423,8 +443,17 @@ def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def recompute_matches(stored: dict[str, Any], payload: dict[str, Any]) -> bool:
-    """用原始请求重新计算，与已存结果逐字段比对，用于 GET 时的可复算校验。"""
+def recompute_matches(
+    stored: dict[str, Any],
+    payload: dict[str, Any],
+    fixed_digits: dict[str, int] | None = None,
+) -> bool:
+    """用原始请求重新计算，与已存结果逐字段比对，用于 GET 时的可复算校验。
 
-    fresh = compute_invoice(payload)
+    ``fixed_digits`` 为该发票入库时固定的原币/目标币精度：复算必须沿用入库
+    精度，币种配置变更后 ``recompute_matched`` 才真实反映「存储结果是否仍与
+    原规则吻合」，而不是被新配置干扰。
+    """
+
+    fresh = compute_invoice(payload, fixed_digits)
     return fresh == stored

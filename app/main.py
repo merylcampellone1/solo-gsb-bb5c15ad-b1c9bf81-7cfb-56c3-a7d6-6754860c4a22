@@ -58,7 +58,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.11.2",
+    version="1.12.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -74,6 +74,9 @@ app = FastAPI(
         "应收账龄汇总（查询日 UTC 结束时点、按币种分桶、不跨币种相加）、"
         "期间税额归集（UTC 自然日闭区间，原币种 + 原发票行税率分组，"
         "分别累计开票、贷项抵减与净额，不使用目标币换算列）、"
+        "币种小数位（原币与目标币）在发票创建时固定并持久化，"
+        "读取与复算沿用发票入库时的精度，CURRENCY_DIGITS 配置变更不影响已存发票，"
+        "新建发票仍按当前配置校验、"
         "所有金额累计与量化统一在按金额量级自动放大的局部精度内进行"
         "（超大金额发票的收款/冲销/余额精确到币种最小单位）、"
         "SQLite 持久化。"
@@ -100,10 +103,25 @@ async def _value_error_handler(_request: Any, exc: ValueError) -> JSONResponse:
 
 
 def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, Any]:
-    """用数据库行重建与 compute_invoice 同构的结果，并用原始请求做复算校验。"""
+    """用数据库行重建与 compute_invoice 同构的结果，并用原始请求做复算校验。
+
+    复算**固定使用该发票入库时的原币/目标币精度**（原币取 ``currency_digits``；
+    目标币取持久化的 ``target_digits``，更早期记录从已持久化换算金额恢复），
+    不读取当前 ``CURRENCY_DIGITS`` 配置——币种精度配置变更后，旧发票仍按旧
+    规则复算，逐行、合计与残差分配与入库时完全一致，``recompute_matched``
+    真实反映存储结果是否与原规则吻合。
+    """
 
     stored_request = json.loads(row["request_json"])
     fx_target = row["target_currency"]
+
+    # 原币位数取头表；目标币位数取持久化列/从已存换算金额恢复（旧记录）
+    fixed_digits: dict[str, int] = {
+        row["currency"]: int(row["currency_digits"])
+    }
+    target_digits = database.invoice_target_digits(row, line_rows)
+    if fx_target is not None and target_digits is not None:
+        fixed_digits[fx_target] = target_digits
 
     lines: list[dict[str, Any]] = []
     for lr in line_rows:
@@ -126,8 +144,8 @@ def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, 
             }
         lines.append(line)
 
-    # 残差分配明细不单独建列，复算一次取回（纯函数，结果确定）
-    fresh = compute_invoice(stored_request)
+    # 残差分配明细不单独建列，按**入库时精度**复算一次取回（纯函数，结果确定）
+    fresh = compute_invoice(stored_request, fixed_digits)
     result: dict[str, Any] = {
         "rule_id": row["rule_id"],
         "currency": row["currency"],
@@ -144,7 +162,9 @@ def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, 
     if fx_target is not None:
         result["fx"] = {
             "target_currency": fx_target,
-            "target_digits": fresh["fx"]["target_digits"],
+            "target_digits": target_digits
+            if target_digits is not None
+            else fresh["fx"]["target_digits"],
             "exchange_rate": row["exchange_rate"],
             "rate_direction": fresh["fx"]["rate_direction"],
             "total_net": row["conv_total_net"],
@@ -163,7 +183,9 @@ def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, 
     result["id"] = row["id"]
     result["due_date"] = row["due_date"]
     result["created_at"] = row["created_at"]
-    result["recompute_matched"] = recompute_matches(core, stored_request)
+    result["recompute_matched"] = recompute_matches(
+        core, stored_request, fixed_digits
+    )
     return result
 
 

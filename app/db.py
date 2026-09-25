@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     currency        TEXT NOT NULL,
     currency_digits INTEGER NOT NULL,
     target_currency TEXT,
+    target_digits   INTEGER,
     exchange_rate   TEXT,
     due_date        TEXT,
     total_net       TEXT NOT NULL,
@@ -252,7 +253,7 @@ def connect(database: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    # 兼容 v1.1 旧库：先为已存在的 invoices 表补上 due_date 列，
+    # 兼容旧库：先为已存在的 invoices 表补上后续版本新增的列，
     # 再执行 CREATE ... IF NOT EXISTS（新库则无表可迁，直接由 SCHEMA 建出）
     table_exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='invoices'"
@@ -261,7 +262,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(invoices)").fetchall()}
         if "due_date" not in columns:
             conn.execute("ALTER TABLE invoices ADD COLUMN due_date TEXT")
-            conn.commit()
+        # 目标币小数位与原币一样在创建时固定并持久化：币种精度配置变更后，
+        # 旧发票（含跨币种换算）读取与复算仍按入库时的目标币精度进行。
+        # target_digits 为 NULL 的更早期发票由读取侧从已持久化换算金额恢复。
+        if "target_digits" not in columns:
+            conn.execute("ALTER TABLE invoices ADD COLUMN target_digits INTEGER")
+        conn.commit()
     conn.executescript(SCHEMA)
     conn.commit()
 
@@ -273,17 +279,19 @@ def save_invoice(conn: sqlite3.Connection, payload: dict[str, Any], result: dict
         cur = conn.execute(
             """
             INSERT INTO invoices (
-                currency, currency_digits, target_currency, exchange_rate,
+                currency, currency_digits, target_currency, target_digits,
+                exchange_rate,
                 due_date,
                 total_net, total_tax, total_gross,
                 conv_total_net, conv_total_tax, conv_total_gross,
                 residual_units, rule_id, request_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result["currency"],
                 result["currency_digits"],
                 result.get("fx", {}).get("target_currency"),
+                (result.get("fx") or {}).get("target_digits"),
                 result.get("fx", {}).get("exchange_rate"),
                 payload.get("due_date"),
                 result["totals"]["total_net"],
@@ -340,6 +348,52 @@ def get_lines(conn: sqlite3.Connection, invoice_id: int) -> list[sqlite3.Row]:
             (invoice_id,),
         ).fetchall()
     )
+
+
+def _digits_from_quantized_texts(texts: Any) -> int | None:
+    """从一批**已按某最小单位量化**的金额文本恢复其小数位数。
+
+    入库的换算金额全部经过 ``quantize(最小单位)``，``format(d, 'f')`` 后保留
+    固定尾随位数（``150.250`` -> 3、``150`` -> 0、``0.000`` -> 3），故取各值
+    Decimal 指数深度的最大值即其量化位数；全部为 ``None``（无换算列）时返回
+    ``None``。
+    """
+
+    digits: int | None = None
+    for text in texts:
+        if text is None:
+            continue
+        exponent = Decimal(text).as_tuple().exponent
+        depth = -int(exponent) if isinstance(exponent, int) and exponent < 0 else 0
+        digits = depth if digits is None else max(digits, depth)
+    return digits
+
+
+def invoice_target_digits(
+    row: sqlite3.Row, line_rows: list[sqlite3.Row]
+) -> int | None:
+    """发票目标币入库时的小数位：优先读持久化列，旧记录从已存换算金额恢复。
+
+    新建发票的目标币位数固定保存在 ``invoices.target_digits``；该列为 ``NULL``
+    的更早期发票（添加列之前已入库）从发票头与逐行的已持久化换算金额
+    （``conv_*``，均按入库时目标币最小单位量化）恢复位数，使跨币种旧发票在
+    ``CURRENCY_DIGITS`` 配置变更后仍能按入库精度读取与复算。无换算（非跨币种
+    发票）时返回 ``None``。
+    """
+
+    stored = row["target_digits"]
+    if stored is not None:
+        return int(stored)
+    if row["target_currency"] is None:
+        return None
+    texts = [
+        row["conv_total_net"],
+        row["conv_total_tax"],
+        row["conv_total_gross"],
+    ]
+    for lr in line_rows:
+        texts.extend((lr["conv_net"], lr["conv_tax"], lr["conv_gross"]))
+    return _digits_from_quantized_texts(texts)
 
 
 def list_invoices(

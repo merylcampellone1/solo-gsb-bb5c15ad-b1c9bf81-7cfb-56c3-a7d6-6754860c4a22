@@ -3144,6 +3144,164 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(again, rev)
 
+    def test_48_invoice_digits_fixed_at_creation(self) -> None:
+        # CURRENCY_DIGITS 配置变更后，已保存发票仍按入库时的原币/目标币精度
+        # 读取与复算：不返回 422，逐行、合计与残差分配保持一致；新发票按新配置校验。
+        import sqlite3
+
+        db_file = os.environ["DB_PATH"]
+        old_env = os.environ.get("CURRENCY_DIGITS")
+        os.environ.pop("CURRENCY_DIGITS", None)
+        try:
+            # 旧配置（USD/CNY 两位）：净额 0.01 + 产生残差的两行发票
+            tiny = {"currency": "USD",
+                    "lines": [{"description": "cent", "net": "0.01",
+                               "tax_rate": "0.10"}]}
+            status, tiny_body = self._request("POST", "/api/v1/invoices", tiny)
+            self.assertEqual(status, 201, tiny_body)
+            id_tiny = tiny_body["id"]
+            self.assertEqual(tiny_body["currency_digits"], 2)
+            self.assertEqual(tiny_body["lines"][0]["net"], "0.01")
+            self.assertEqual(tiny_body["totals"]["total_gross"], "0.01")
+
+            residual = {"currency": "USD",
+                        "lines": [
+                            {"description": "books", "net": "10.05",
+                             "tax_rate": "0.10"},
+                            {"description": "pens", "net": "20.05",
+                             "tax_rate": "0.10"},
+                        ]}
+            status, res_body = self._request(
+                "POST", "/api/v1/invoices", residual
+            )
+            self.assertEqual(status, 201, res_body)
+            id_res = res_body["id"]
+            # 入库时：行税 1.00/2.01、合计 3.01、-0.01 残差分给第 1 行
+            self.assertEqual(
+                [l["tax"] for l in res_body["lines"]], ["1.00", "2.01"]
+            )
+            self.assertEqual(res_body["totals"]["total_tax"], "3.01")
+            self.assertEqual(res_body["rounding"]["residual_units"], -1)
+            self.assertEqual(
+                res_body["rounding"]["allocations"],
+                [{"line_no": 1, "delta_units": -1,
+                  "remainder": "0.005", "rank": 1}],
+            )
+
+            # 跨币种：USD -> CNY，目标币两位，+0.01 残差分给第 1 行
+            fx = {"currency": "USD", "target_currency": "CNY",
+                  "exchange_rate": "7.123456",
+                  "lines": [
+                      {"description": "consulting", "net": "100.00",
+                       "tax_rate": "0.13"},
+                      {"description": "travel", "net": "50.00",
+                       "tax_rate": "0.06"},
+                  ]}
+            status, fx_body = self._request("POST", "/api/v1/invoices", fx)
+            self.assertEqual(status, 201, fx_body)
+            id_fx = fx_body["id"]
+            self.assertEqual(fx_body["fx"]["target_digits"], 2)
+            self.assertEqual(fx_body["fx"]["total_tax"], "113.98")
+            self.assertEqual(
+                [l["converted"]["tax"] for l in fx_body["lines"]],
+                ["92.61", "21.37"],
+            )
+
+            # 更早期历史记录：target_digits 列缺失值（NULL）须从已持久化换算金额恢复
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    "UPDATE invoices SET target_digits = NULL WHERE id = ?",
+                    (id_fx,),
+                )
+                c.commit()
+            finally:
+                c.close()
+
+            # 变更配置：USD、CNY 都改为零位
+            os.environ["CURRENCY_DIGITS"] = "USD:0,CNY:0"
+
+            # GET 三张旧发票：200，金额/位数/残差分配与入库时完全一致
+            status, got_tiny = self._request(
+                "GET", f"/api/v1/invoices/{id_tiny}"
+            )
+            self.assertEqual(status, 200, got_tiny)
+            self.assertEqual(got_tiny["currency_digits"], 2)
+            self.assertEqual(got_tiny["lines"][0]["net"], "0.01")
+            self.assertEqual(got_tiny["totals"], tiny_body["totals"])
+            self.assertEqual(
+                got_tiny["rounding"]["minor_unit"], "0.01"
+            )
+            self.assertTrue(got_tiny["recompute_matched"])
+
+            status, got_res = self._request(
+                "GET", f"/api/v1/invoices/{id_res}"
+            )
+            self.assertEqual(status, 200, got_res)
+            self.assertEqual(
+                [l["tax"] for l in got_res["lines"]], ["1.00", "2.01"]
+            )
+            self.assertEqual(got_res["totals"], res_body["totals"])
+            self.assertEqual(got_res["rounding"], res_body["rounding"])
+            self.assertTrue(got_res["recompute_matched"])
+
+            status, got_fx = self._request(
+                "GET", f"/api/v1/invoices/{id_fx}"
+            )
+            self.assertEqual(status, 200, got_fx)
+            self.assertEqual(got_fx["fx"]["target_digits"], 2)
+            self.assertEqual(
+                got_fx["fx"]["total_tax"], fx_body["fx"]["total_tax"]
+            )
+            self.assertEqual(
+                [l["converted"] for l in got_fx["lines"]],
+                [l["converted"] for l in fx_body["lines"]],
+            )
+            self.assertEqual(
+                got_fx["fx"]["allocations"], fx_body["fx"]["allocations"]
+            )
+            self.assertTrue(got_fx["recompute_matched"])
+
+            # 旧发票的收款仍按入库精度：零位配置下可登记 0.01
+            status, pay = self._request(
+                "POST", f"/api/v1/invoices/{id_tiny}/payments",
+                {"amount": "0.01"},
+            )
+            self.assertEqual(status, 201, pay)
+            self.assertEqual(pay["outstanding"], "0.00")
+
+            # 新发票按当前（零位）配置：整数净额合法，两位净额 422
+            status, new_body = self._request(
+                "POST", "/api/v1/invoices",
+                {"currency": "USD",
+                 "lines": [{"net": "1", "tax_rate": "0.10"}]},
+            )
+            self.assertEqual(status, 201, new_body)
+            self.assertEqual(new_body["currency_digits"], 0)
+            self.assertEqual(new_body["lines"][0]["net"], "1")
+
+            status, bad = self._request(
+                "POST", "/api/v1/invoices",
+                {"currency": "USD",
+                 "lines": [{"net": "0.01", "tax_rate": "0.10"}]},
+            )
+            self.assertEqual(status, 422, bad)
+
+            # 同币种零位目标币的新发票按零位换算
+            status, new_fx = self._request(
+                "POST", "/api/v1/invoices",
+                {"currency": "JPY", "target_currency": "USD",
+                 "exchange_rate": "0.009",
+                 "lines": [{"net": "100", "tax_rate": "0.10"}]},
+            )
+            self.assertEqual(status, 201, new_fx)
+            self.assertEqual(new_fx["fx"]["target_digits"], 0)
+        finally:
+            if old_env is None:
+                os.environ.pop("CURRENCY_DIGITS", None)
+            else:
+                os.environ["CURRENCY_DIGITS"] = old_env
+
 
 if __name__ == "__main__":
     unittest.main()
