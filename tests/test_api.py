@@ -3144,6 +3144,146 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(again, rev)
 
+    def test_48_saved_invoices_keep_digits_after_config_change(self) -> None:
+        # 创建时固定原币/目标币小数位：CURRENCY_DIGITS 变更后，已保存发票的读取、
+        # 行/合计/残差分配与 recompute_matched 仍按入库精度；新发票按新配置校验。
+        # 旧发票（USD 两位、净额 0.01）
+        status, old_inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "0.01", "tax_rate": "0.10"}]},
+        )
+        self.assertEqual(status, 201, old_inv)
+        self.assertEqual(old_inv["currency_digits"], 2)
+        self.assertEqual(old_inv["lines"][0]["net"], "0.01")
+        self.assertEqual(old_inv["lines"][0]["tax"], "0.00")
+        old_id = old_inv["id"]
+
+        # 含残差分配的两位旧发票（10.05/20.05 @10% -> 残差 -1 分给第 1 行）
+        status, residual_inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"net": "10.05", "tax_rate": "0.10"},
+                    {"net": "20.05", "tax_rate": "0.10"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, residual_inv)
+        self.assertEqual(residual_inv["rounding"]["residual_units"], -1)
+        self.assertEqual(
+            [ln["tax"] for ln in residual_inv["lines"]], ["1.00", "2.01"]
+        )
+        residual_id = residual_inv["id"]
+
+        # 跨币种旧发票：USD(2) -> JPY(0)
+        status, fx_inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "target_currency": "JPY",
+                "exchange_rate": "150.25",
+                "lines": [{"net": "1.00", "tax_rate": "0.10"}],
+            },
+        )
+        self.assertEqual(status, 201, fx_inv)
+        self.assertEqual(fx_inv["fx"]["target_digits"], 0)
+        self.assertEqual(fx_inv["lines"][0]["converted"]["net"], "150")
+        fx_id = fx_inv["id"]
+
+        # 在**同一运行进程**内把 USD 改成零位、JPY 改成两位（配置即时生效）
+        old_env = os.environ.get("CURRENCY_DIGITS")
+        os.environ["CURRENCY_DIGITS"] = "USD:0,JPY:2"
+        try:
+            # 旧 USD 发票读取不再 422，逐行/合计/残差分配与入库时完全一致
+            status, fetched = self._request("GET", f"/api/v1/invoices/{old_id}")
+            self.assertEqual(status, 200, fetched)
+            self.assertEqual(fetched["currency_digits"], 2)
+            self.assertEqual(fetched["lines"][0]["net"], "0.01")
+            self.assertEqual(fetched["lines"][0]["tax"], "0.00")
+            self.assertEqual(fetched["totals"], old_inv["totals"])
+            self.assertEqual(fetched["rounding"]["minor_unit"], "0.01")
+            self.assertTrue(fetched["recompute_matched"])
+
+            # 残差分配明细按旧精度复算，保持一致
+            status, fr = self._request("GET", f"/api/v1/invoices/{residual_id}")
+            self.assertEqual(status, 200, fr)
+            self.assertEqual(fr["currency_digits"], 2)
+            self.assertEqual(fr["rounding"]["residual_units"], -1)
+            self.assertEqual(
+                fr["rounding"]["allocations"],
+                residual_inv["rounding"]["allocations"],
+            )
+            self.assertEqual(
+                [ln["tax"] for ln in fr["lines"]], ["1.00", "2.01"]
+            )
+            self.assertEqual(fr["totals"], residual_inv["totals"])
+            self.assertTrue(fr["recompute_matched"])
+
+            # 旧 FX 发票：目标币仍按入库时的零位恢复（历史行 target_digits 为
+            # NULL 也须从已持久化换算金额恢复），换算列与残差单位不变
+            status, ff = self._request("GET", f"/api/v1/invoices/{fx_id}")
+            self.assertEqual(status, 200, ff)
+            self.assertEqual(ff["currency_digits"], 2)
+            self.assertEqual(ff["fx"]["target_digits"], 0)
+            self.assertEqual(ff["fx"]["residual_unit"], "1")
+            self.assertEqual(
+                ff["lines"][0]["converted"], fx_inv["lines"][0]["converted"]
+            )
+            self.assertEqual(
+                ff["fx"]["total_net"], fx_inv["fx"]["total_net"]
+            )
+            self.assertTrue(ff["recompute_matched"])
+
+            # 新建发票仍按当前配置校验：USD 零位下 0.01 净额被拒绝
+            status, rejected = self._request(
+                "POST",
+                "/api/v1/invoices",
+                {"currency": "USD", "lines": [{"net": "0.01", "tax_rate": "0.10"}]},
+            )
+            self.assertEqual(status, 422, rejected)
+
+            # 零位整数净额的新发票按新精度保存与复算
+            status, new_inv = self._request(
+                "POST",
+                "/api/v1/invoices",
+                {"currency": "USD", "lines": [{"net": "5", "tax_rate": "0.10"}]},
+            )
+            self.assertEqual(status, 201, new_inv)
+            self.assertEqual(new_inv["currency_digits"], 0)
+            self.assertEqual(new_inv["lines"][0]["net"], "5")
+            self.assertEqual(new_inv["lines"][0]["tax"], "1")
+            self.assertTrue(new_inv["recompute_matched"])
+            new_id = new_inv["id"]
+            status, nf = self._request("GET", f"/api/v1/invoices/{new_id}")
+            self.assertEqual(status, 200, nf)
+            self.assertEqual(nf["currency_digits"], 0)
+            self.assertEqual(nf["rounding"]["minor_unit"], "1")
+            self.assertTrue(nf["recompute_matched"])
+
+            # 新 FX 发票的目标币按当前配置固定为两位并持久化
+            status, new_fx = self._request(
+                "POST",
+                "/api/v1/invoices",
+                {
+                    "currency": "USD",
+                    "target_currency": "JPY",
+                    "exchange_rate": "150.25",
+                    "lines": [{"net": "5", "tax_rate": "0.10"}],
+                },
+            )
+            self.assertEqual(status, 201, new_fx)
+            self.assertEqual(new_fx["fx"]["target_digits"], 2)
+            self.assertEqual(new_fx["lines"][0]["converted"]["net"], "751.25")
+        finally:
+            if old_env is None:
+                os.environ.pop("CURRENCY_DIGITS", None)
+            else:
+                os.environ["CURRENCY_DIGITS"] = old_env
+
 
 if __name__ == "__main__":
     unittest.main()

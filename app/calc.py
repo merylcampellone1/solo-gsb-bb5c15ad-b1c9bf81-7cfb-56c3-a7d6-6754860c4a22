@@ -61,6 +61,27 @@ def _quantize(value: Decimal, digits: int) -> Decimal:
     return value.quantize(_unit(digits), rounding=ROUND_HALF_UP)
 
 
+def digits_from_quantized_text(value: str | None) -> int | None:
+    """从已按最小单位量化持久化的金额字符串恢复其币种小数位。
+
+    入库金额一律经 ``_s(Decimal.quantize(unit))`` 以无指数定点字符串保存
+    （``"712.35"`` -> 2、``"150"`` -> 0、``"0.100"`` -> 3），因此尾随小数位即
+    币种小数位；用于为没有独立精度列的历史记录恢复**目标币**精度。无法解析或
+    位数超出 0~4 时返回 ``None``。
+    """
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or "." not in text:
+        return 0 if text else None
+    frac = text.rsplit(".", 1)[1]
+    if not frac.isdigit():
+        return None
+    digits = len(frac)
+    return digits if 0 <= digits <= 4 else None
+
+
 def to_decimal(value: Any, field: str) -> Decimal:
     """把入参（字符串/int/Decimal）安全转成 Decimal；禁止 float。"""
 
@@ -285,21 +306,44 @@ def money_context(amounts: Iterable[Decimal], count: int = 1) -> Iterator[None]:
         yield
 
 
-def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
+def _validate_digits(digits: int | None, field: str) -> int | None:
+    """校验外部（入库时）固定下来的币种小数位，取值须在 0~4。"""
+
+    if digits is None:
+        return None
+    if not isinstance(digits, int) or isinstance(digits, bool) or not (0 <= digits <= 4):
+        raise ValueError(f"{field} 必须是 0~4 之间的整数，收到 {digits!r}")
+    return digits
+
+
+def compute_invoice(
+    payload: dict[str, Any],
+    digits: int | None = None,
+    target_digits: int | None = None,
+) -> dict[str, Any]:
     """执行完整计算，返回可直接 JSON 序列化（金额全部为字符串）的结果字典。
 
     该函数是纯函数：同样输入必然得到同样输出，持久化与复算都以它为准。
     不读不写全局 Decimal 上下文，任何线程（含默认 28 位精度的 FastAPI
     工作线程）下结果一致。
+
+    ``digits`` / ``target_digits`` 给出原币 / 目标币**入库时固定**的小数位：
+    传入时直接沿用，不再查询当前 ``CURRENCY_DIGITS`` 配置——币种精度配置变更后，
+    读取与复算旧发票仍按该发票保存时的精度进行（旧的两位 USD 发票不会在 USD
+    被改成零位后复算失败）；缺省（创建发票）则按当前配置解析币种小数位，新发票
+    仍按当前配置校验。
     """
 
     currency = str(payload["currency"]).strip().upper()
     if not currency:
         raise ValueError("currency 不能为空")
-    try:
-        digits = currency_digits(currency)
-    except UnknownCurrencyError:
-        raise
+    digits = _validate_digits(digits, "currency_digits")
+    target_digits = _validate_digits(target_digits, "target_digits")
+    if digits is None:
+        try:
+            digits = currency_digits(currency)
+        except UnknownCurrencyError:
+            raise
 
     lines_in = _validate_lines(payload.get("lines", []))
     n = len(lines_in)
@@ -346,7 +390,8 @@ def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
             exchange_rate = to_decimal(payload["exchange_rate"], "exchange_rate")
             if exchange_rate <= _ZERO:
                 raise ValueError("exchange_rate 必须为正数")
-            target_digits = currency_digits(target_currency)
+            if target_digits is None:
+                target_digits = currency_digits(target_currency)
 
             converted_nets = [
                 _quantize(nets[i] * exchange_rate, target_digits) for i in range(n)
@@ -423,8 +468,18 @@ def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def recompute_matches(stored: dict[str, Any], payload: dict[str, Any]) -> bool:
-    """用原始请求重新计算，与已存结果逐字段比对，用于 GET 时的可复算校验。"""
+def recompute_matches(
+    stored: dict[str, Any],
+    payload: dict[str, Any],
+    digits: int | None = None,
+    target_digits: int | None = None,
+) -> bool:
+    """用原始请求重新计算，与已存结果逐字段比对，用于 GET 时的可复算校验。
 
-    fresh = compute_invoice(payload)
+    读取已保存发票时必须传入该发票**入库时固定**的 ``digits`` / ``target_digits``，
+    使复算沿用保存时的币种精度而不是当前 ``CURRENCY_DIGITS`` 配置：配置变更前后
+    已存的行、合计与残差分配保持一致，配置真正改变后新发票才按新精度计算。
+    """
+
+    fresh = compute_invoice(payload, digits=digits, target_digits=target_digits)
     return fresh == stored

@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import db as database
-from .calc import compute_invoice, recompute_matches, to_decimal
+from .calc import compute_invoice, digits_from_quantized_text, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
 from .duplicates import find_duplicates
 from .schemas import (
@@ -58,7 +58,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.11.2",
+    version="1.11.3",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -99,11 +99,50 @@ async def _value_error_handler(_request: Any, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
+def _stored_target_digits(
+    row: sqlite3.Row, line_rows: list[sqlite3.Row]
+) -> int | None:
+    """恢复一张已保存发票**入库时固定**的目标币小数位。
+
+    新库发票直接读 ``invoices.target_digits``；该列为 NULL 的历史行则从已持久化
+    的换算金额（定点、已按目标币最小单位量化）恢复：发票头的换算合计与逐行换算
+    净额/税额/含税额推断出的位数应一致，取其中最大值作稳妥兜底。无换算列时为
+    ``None``（该发票本就没有目标币段）。
+    """
+
+    if row["target_currency"] is None:
+        return None
+    pinned = row["target_digits"]
+    if pinned is not None:
+        return int(pinned)
+
+    candidates = [
+        row["conv_total_net"],
+        row["conv_total_tax"],
+        row["conv_total_gross"],
+    ]
+    for lr in line_rows:
+        candidates.extend([lr["conv_net"], lr["conv_tax"], lr["conv_gross"]])
+    inferred = [
+        d for d in (digits_from_quantized_text(v) for v in candidates) if d is not None
+    ]
+    return max(inferred) if inferred else None
+
+
 def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, Any]:
-    """用数据库行重建与 compute_invoice 同构的结果，并用原始请求做复算校验。"""
+    """用数据库行重建与 compute_invoice 同构的结果，并用原始请求做复算校验。
+
+    原币与目标币小数位均**沿用该发票入库时固定的精度**（目标币为历史行时从已
+    持久化换算金额恢复），不读当前 ``CURRENCY_DIGITS`` 配置：币种精度配置变更后，
+    已保存发票的读取、残差复算与 ``recompute_matched`` 仍按保存时的精度进行，
+    已存行、合计与残差分配保持一致；只有创建新发票才按当前配置校验。
+    """
 
     stored_request = json.loads(row["request_json"])
     fx_target = row["target_currency"]
+    # 入库时固定的币种精度：原币读头表列，目标币读列或从持久化换算金额恢复
+    stored_digits = int(row["currency_digits"])
+    stored_target_digits = _stored_target_digits(row, line_rows)
 
     lines: list[dict[str, Any]] = []
     for lr in line_rows:
@@ -126,8 +165,12 @@ def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, 
             }
         lines.append(line)
 
-    # 残差分配明细不单独建列，复算一次取回（纯函数，结果确定）
-    fresh = compute_invoice(stored_request)
+    # 残差分配明细不单独建列，按发票保存时的精度复算一次取回（纯函数，结果确定）
+    fresh = compute_invoice(
+        stored_request,
+        digits=stored_digits,
+        target_digits=stored_target_digits,
+    )
     result: dict[str, Any] = {
         "rule_id": row["rule_id"],
         "currency": row["currency"],
@@ -163,7 +206,12 @@ def _row_to_result(row: sqlite3.Row, line_rows: list[sqlite3.Row]) -> dict[str, 
     result["id"] = row["id"]
     result["due_date"] = row["due_date"]
     result["created_at"] = row["created_at"]
-    result["recompute_matched"] = recompute_matches(core, stored_request)
+    result["recompute_matched"] = recompute_matches(
+        core,
+        stored_request,
+        digits=stored_digits,
+        target_digits=stored_target_digits,
+    )
     return result
 
 

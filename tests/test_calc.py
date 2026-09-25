@@ -9,7 +9,14 @@ import threading
 import unittest
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 
-from app.calc import RULE_ID, compute_invoice, money_context, money_prec, recompute_matches
+from app.calc import (
+    RULE_ID,
+    compute_invoice,
+    digits_from_quantized_text,
+    money_context,
+    money_prec,
+    recompute_matches,
+)
 
 
 def line(net: str, rate: str, desc: str | None = None) -> dict:
@@ -324,6 +331,71 @@ class LocalPrecisionTests(unittest.TestCase):
         r_main = compute_invoice(payload)
         r_worker = self._run_in_fresh_thread(lambda: compute_invoice(payload))
         self.assertEqual(r_main, r_worker)
+
+
+class PinnedDigitsTests(unittest.TestCase):
+    """入库时固定的币种小数位：读取/复算旧发票不随 CURRENCY_DIGITS 配置改变。"""
+
+    def setUp(self) -> None:
+        import os
+
+        self._old = os.environ.get("CURRENCY_DIGITS")
+        os.environ["CURRENCY_DIGITS"] = "USD:0,JPY:2"
+
+    def tearDown(self) -> None:
+        import os
+
+        if self._old is None:
+            os.environ.pop("CURRENCY_DIGITS", None)
+        else:
+            os.environ["CURRENCY_DIGITS"] = self._old
+
+    def test_create_uses_current_config(self):
+        # 当前配置 USD 为零位：0.01 净额创建时按当前配置被拒绝
+        with self.assertRaises(ValueError):
+            compute_invoice({"currency": "USD", "lines": [line("0.01", "0.10")]})
+        r = compute_invoice({"currency": "USD", "lines": [line("5", "0.10")]})
+        self.assertEqual(r["currency_digits"], 0)
+        self.assertEqual(r["lines"][0]["tax"], "1")
+
+    def test_pinned_source_digits_keep_old_precision(self):
+        payload = {"currency": "USD", "lines": [line("0.01", "0.10")]}
+        # 当前 USD 为零位，但显式固定两位（旧发票入库精度）仍按两位计算
+        r = compute_invoice(payload, digits=2)
+        self.assertEqual(r["currency_digits"], 2)
+        self.assertEqual(r["rounding"]["minor_unit"], "0.01")
+        self.assertEqual(r["lines"][0]["net"], "0.01")
+        self.assertTrue(recompute_matches(r, payload, digits=2))
+        # 不固定位数按当前配置复算：0.01 落不到零位最小单位（正是修复前 GET 旧发票
+        # 返回 422 的根因），而固定旧精度的复算正常吻合
+        with self.assertRaises(ValueError):
+            recompute_matches(r, payload)
+
+    def test_pinned_target_digits_keep_old_fx_precision(self):
+        payload = {
+            "currency": "USD",
+            "target_currency": "JPY",
+            "exchange_rate": "150.25",
+            "lines": [line("1.00", "0.10")],
+        }
+        # 旧发票：USD 两位、JPY 零位；当前配置已把 JPY 改成两位
+        r = compute_invoice(payload, digits=2, target_digits=0)
+        self.assertEqual(r["fx"]["target_digits"], 0)
+        self.assertEqual(r["lines"][0]["converted"]["net"], "150")
+        self.assertEqual(r["fx"]["residual_unit"], "1")
+        self.assertTrue(recompute_matches(r, payload, digits=2, target_digits=0))
+
+
+class DigitsRecoveryTests(unittest.TestCase):
+    """历史记录（无 target_digits 列）从已持久化金额恢复目标币精度。"""
+
+    def test_digits_from_quantized_text(self):
+        self.assertEqual(digits_from_quantized_text("150"), 0)
+        self.assertEqual(digits_from_quantized_text("712.35"), 2)
+        self.assertEqual(digits_from_quantized_text("0.100"), 3)
+        self.assertIsNone(digits_from_quantized_text(None))
+        self.assertIsNone(digits_from_quantized_text(""))
+        self.assertIsNone(digits_from_quantized_text("1.23456"))
 
 
 class MoneyContextTests(unittest.TestCase):

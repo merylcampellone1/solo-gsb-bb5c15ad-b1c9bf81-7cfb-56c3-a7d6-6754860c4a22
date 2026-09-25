@@ -2,6 +2,9 @@
 
 存储十张表：
 * ``invoices``          —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
+  ``currency_digits`` / ``target_digits`` 固定该发票入库时的原币 / 目标币小数位，
+  币种精度配置（CURRENCY_DIGITS）变更后读取与复算仍沿用入库精度（历史行
+  ``target_digits`` 可能为 NULL，由读取层从已持久化换算金额恢复）；
 * ``invoice_lines``     —— 逐行结果（税额残差分配后的最终值，含换算列）；
 * ``payments``          —— 收款登记（每笔收款的金额、币种与登记时间）；
 * ``payment_reversals`` —— 收款冲销（每笔冲销的金额、币种与登记时间，
@@ -43,6 +46,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     currency        TEXT NOT NULL,
     currency_digits INTEGER NOT NULL,
     target_currency TEXT,
+    target_digits   INTEGER,
     exchange_rate   TEXT,
     due_date        TEXT,
     total_net       TEXT NOT NULL,
@@ -261,7 +265,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(invoices)").fetchall()}
         if "due_date" not in columns:
             conn.execute("ALTER TABLE invoices ADD COLUMN due_date TEXT")
-            conn.commit()
+        # 目标币小数位在创建时随发票固定：旧库先补列（历史行 NULL，读取时从
+        # 已持久化的换算金额恢复目标币精度），再由 SCHEMA 建出其余新表
+        if "target_digits" not in columns:
+            conn.execute("ALTER TABLE invoices ADD COLUMN target_digits INTEGER")
+        conn.commit()
     conn.executescript(SCHEMA)
     conn.commit()
 
@@ -273,17 +281,18 @@ def save_invoice(conn: sqlite3.Connection, payload: dict[str, Any], result: dict
         cur = conn.execute(
             """
             INSERT INTO invoices (
-                currency, currency_digits, target_currency, exchange_rate,
-                due_date,
+                currency, currency_digits, target_currency, target_digits,
+                exchange_rate, due_date,
                 total_net, total_tax, total_gross,
                 conv_total_net, conv_total_tax, conv_total_gross,
                 residual_units, rule_id, request_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result["currency"],
                 result["currency_digits"],
                 result.get("fx", {}).get("target_currency"),
+                (result.get("fx") or {}).get("target_digits"),
                 result.get("fx", {}).get("exchange_rate"),
                 payload.get("due_date"),
                 result["totals"]["total_net"],
